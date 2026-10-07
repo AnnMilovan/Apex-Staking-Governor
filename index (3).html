@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ApexStakingGovernor {
+    struct StakerProfile {
+        uint256 stakedAmount;
+        address delegatedTo;
+        uint256 lastClaimBlock;
+        bool hasActiveStake;
+    }
+
+    address payable public immutable governorAdmin;
+    string public protocolName;
+    uint256 public totalStakedCapital;
+    uint256 public yieldPoolBalance;
+
+    mapping(address => StakerProfile) public stakers;
+    mapping(address => uint256) public votingPower;
+    mapping(uint256 => mapping(address => bool)) public proposalVotes;
+
+    event GovernanceVoteCast(uint256 indexed proposalId, address indexed voter, bool support);
+    event YieldClaimed(address indexed account, uint256 yieldAmount);
+    event VotingPowerDelegated(address indexed from, address indexed to, uint256 weight);
+    event CapitalStaked(address indexed account, uint256 amount);
+    event EmergencyDrain(address indexed receiver, uint256 amount);
+    event YieldPoolFunded(address indexed funder, uint256 amount);
+    event DelegationRevoked(address indexed from, address indexed previousDelegate);
+    event CapitalWithdrawn(address indexed account, uint256 amount);
+
+    modifier onlyAdmin() {
+        require(msg.sender == governorAdmin, "ApexGovernor: Access denied");
+        _;
+    }
+
+    constructor() {
+        governorAdmin = payable(msg.sender);
+        protocolName = "Apex Base Staking Governor v1";
+    }
+
+    // 1. castGovernanceVote
+    function castGovernanceVote(uint256 proposalId, bool support) external {
+        require(votingPower[msg.sender] > 0 || stakers[msg.sender].hasActiveStake, "ApexGovernor: Zero voting weight");
+        require(!proposalVotes[proposalId][msg.sender], "ApexGovernor: Already voted");
+
+        proposalVotes[proposalId][msg.sender] = true;
+        emit GovernanceVoteCast(proposalId, msg.sender, support);
+    }
+
+    // 2. claimStakingYield
+    function claimStakingYield(uint256 rewardAmount) external {
+        StakerProfile storage sp = stakers[msg.sender];
+        require(sp.hasActiveStake, "ApexGovernor: No active stake");
+        require(rewardAmount > 0 && rewardAmount <= yieldPoolBalance, "ApexGovernor: Invalid reward amount");
+
+        yieldPoolBalance -= rewardAmount;
+        sp.lastClaimBlock = block.number;
+
+        (bool sent, ) = payable(msg.sender).call{value: rewardAmount}("");
+        require(sent, "ApexGovernor: Yield transfer failed");
+
+        emit YieldClaimed(msg.sender, rewardAmount);
+    }
+
+    // 3. delegateVotingPower
+    function delegateVotingPower(address delegatee) external {
+        require(delegatee != address(0), "ApexGovernor: Invalid delegatee");
+        StakerProfile storage sp = stakers[msg.sender];
+        require(sp.hasActiveStake, "ApexGovernor: Zero stake to delegate");
+
+        address prev = sp.delegatedTo;
+        if (prev != address(0) && votingPower[prev] >= sp.stakedAmount) {
+            votingPower[prev] -= sp.stakedAmount;
+        }
+
+        sp.delegatedTo = delegatee;
+        votingPower[delegatee] += sp.stakedAmount;
+
+        emit VotingPowerDelegated(msg.sender, delegatee, sp.stakedAmount);
+    }
+
+    // 4. depositStakingCapital
+    function depositStakingCapital() external payable {
+        require(msg.value > 0, "ApexGovernor: Deposit must be positive");
+
+        StakerProfile storage sp = stakers[msg.sender];
+        sp.stakedAmount += msg.value;
+        sp.lastClaimBlock = block.number;
+        sp.hasActiveStake = true;
+
+        if (sp.delegatedTo != address(0)) {
+            votingPower[sp.delegatedTo] += msg.value;
+        } else {
+            votingPower[msg.sender] += msg.value;
+        }
+
+        totalStakedCapital += msg.value;
+        emit CapitalStaked(msg.sender, msg.value);
+    }
+
+    // 5. emergencySweep
+    function emergencySweep() external onlyAdmin {
+        uint256 surplus = address(this).balance > totalStakedCapital ? address(this).balance - totalStakedCapital : 0;
+        if (surplus == 0 && address(this).balance > 0 && totalStakedCapital == 0) {
+            surplus = address(this).balance;
+        }
+        require(surplus > 0, "ApexGovernor: Zero surplus");
+
+        (bool sent, ) = governorAdmin.call{value: surplus}("");
+        require(sent, "ApexGovernor: Sweep failed");
+
+        emit EmergencyDrain(governorAdmin, surplus);
+    }
+
+    // 6. fundYieldPool
+    function fundYieldPool() external payable onlyAdmin {
+        require(msg.value > 0, "ApexGovernor: Zero funding value");
+        yieldPoolBalance += msg.value;
+        emit YieldPoolFunded(msg.sender, msg.value);
+    }
+
+    // 7. revokeDelegation
+    function revokeDelegation() external {
+        StakerProfile storage sp = stakers[msg.sender];
+        require(sp.delegatedTo != address(0), "ApexGovernor: No delegation active");
+
+        address prev = sp.delegatedTo;
+        if (votingPower[prev] >= sp.stakedAmount) {
+            votingPower[prev] -= sp.stakedAmount;
+        }
+        sp.delegatedTo = address(0);
+        votingPower[msg.sender] += sp.stakedAmount;
+
+        emit DelegationRevoked(msg.sender, prev);
+    }
+
+    // 8. withdrawStakingCapital
+    function withdrawStakingCapital(uint256 amount) external {
+        StakerProfile storage sp = stakers[msg.sender];
+        require(sp.hasActiveStake && sp.stakedAmount >= amount && amount > 0, "ApexGovernor: Insufficient stake");
+
+        sp.stakedAmount -= amount;
+        totalStakedCapital -= amount;
+
+        if (sp.delegatedTo != address(0)) {
+            if (votingPower[sp.delegatedTo] >= amount) {
+                votingPower[sp.delegatedTo] -= amount;
+            }
+        } else {
+            if (votingPower[msg.sender] >= amount) {
+                votingPower[msg.sender] -= amount;
+            }
+        }
+
+        if (sp.stakedAmount == 0) {
+            sp.hasActiveStake = false;
+        }
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "ApexGovernor: Withdrawal failed");
+
+        emit CapitalWithdrawn(msg.sender, amount);
+    }
+
+    // Чтение информации о стейкере
+    function getStakerDetails(address user) external view returns (
+        uint256 staked,
+        address delegatedTo,
+        uint256 power,
+        bool active
+    ) {
+        StakerProfile memory sp = stakers[user];
+        return (sp.stakedAmount, sp.delegatedTo, votingPower[user], sp.hasActiveStake);
+    }
+}
